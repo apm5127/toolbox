@@ -153,9 +153,10 @@ pub const VerboseBuilder = struct {
     var options: BuildOptions = .{};
 
     __builder: *std.Build,
-    __walker: ?std.fs.Dir.Walker,
-    __iterator: ?std.fs.Dir.Iterator,
-    __dir: std.fs.Dir,
+    __walker: ?std.Io.Dir.Walker,
+    __iterator: ?std.Io.Dir.Iterator,
+    __dir: std.Io.Dir,
+    __io: std.Io,
     __prefix: []const u8,
     __build_fn: ?*const fn (*@This()) anyerror!void,
     __update_fn: ?*const fn (*@This()) anyerror!void,
@@ -167,6 +168,7 @@ pub const VerboseBuilder = struct {
             .__walker = null,
             .__iterator = null,
             .__dir = builder.build_root.handle,
+            .__io = builder.graph.io,
             .__prefix = "/",
             .__build_fn = build_fn,
             .__update_fn = update_fn,
@@ -188,6 +190,7 @@ pub const VerboseBuilder = struct {
             .__walker = null,
             .__iterator = null,
             .__dir = dep.builder.build_root.handle,
+            .__io = dep.builder.graph.io,
             .__prefix = "/",
             .__build_fn = null,
             .__update_fn = null,
@@ -210,19 +213,21 @@ pub const VerboseBuilder = struct {
             const uri = try std.Uri.parse(@field(zon.dependencies, field.name).url);
             const host = uri.getHostAlloc(self.getAllocator()) catch @panic("OOM");
             const path = self.uriComponent(&uri.path);
-            var tmp = std.testing.tmpDir(.{});
-            defer tmp.cleanup();
-            const tmp_path = self.resolve(&.{ self.getBuilder().cache_root.path.?, "tmp", &tmp.sub_path });
+            // var tmp = std.testing.tmpDir(.{});
+            // defer tmp.cleanup();
+            // const tmp_path = self.resolve(&.{ self.getBuilder().cache_root.path.?, "tmp", &tmp.sub_path });
+            const tmp_path = self.ptrBuilder().tmpPath().src_path.sub_path;
+            const tmp = try std.Io.Dir.cwd().openDir(self.getIo(), tmp_path, .{});
             if (@hasField(@TypeOf(@field(zon.dependencies, field.name)), "branch")) {
-                _ = try self.run(&.{ "git", "clone", "--bare", "--branch", @field(zon.dependencies, field.name).branch, "--filter=blob:none", "--", self.fmt("https://{s}{s}", .{ host, path }), tmp_path }, self.ptrCwd().*);
+                _ = try self.run(&.{ "git", "clone", "--bare", "--branch", @field(zon.dependencies, field.name).branch, "--filter=blob:none", "--", self.fmt("https://{s}{s}", .{ host.bytes, path }), tmp_path }, self.ptrCwd().*);
             } else {
-                _ = try self.run(&.{ "git", "clone", "--bare", "--filter=blob:none", "--", self.fmt("https://{s}{s}", .{ host, path }), tmp_path }, self.ptrCwd().*);
+                _ = try self.run(&.{ "git", "clone", "--bare", "--filter=blob:none", "--", self.fmt("https://{s}{s}", .{ host.bytes, path }), tmp_path }, self.ptrCwd().*);
             }
             var latest: []const u8 = undefined;
             if (uri.query) |_| {
-                const commits = try std.fmt.parseUnsigned(usize, try self.run(&.{ "git", "rev-list", "--count", "--all" }, tmp.dir), 10);
+                const commits = try std.fmt.parseUnsigned(usize, try self.run(&.{ "git", "rev-list", "--count", "--all" }, tmp), 10);
                 for (0..commits) |i| {
-                    latest = self.run(&.{ "git", "describe", "--tags", "--exact-match", self.fmt("HEAD~{}", .{i}) }, tmp.dir) catch |err| switch (err) {
+                    latest = self.run(&.{ "git", "describe", "--tags", "--exact-match", self.fmt("HEAD~{}", .{i}) }, tmp) catch |err| switch (err) {
                         error.ExitCodeFailure => continue,
                         else => return err,
                     };
@@ -230,9 +235,9 @@ pub const VerboseBuilder = struct {
                     break;
                 } else return error.NoValidTag;
             } else {
-                latest = try self.run(&.{ "git", "rev-parse", "HEAD" }, tmp.dir);
+                latest = try self.run(&.{ "git", "rev-parse", "HEAD" }, tmp);
             }
-            _ = try self.run(&.{ "zig", "fetch", "--save=" ++ field.name, self.fmt("git+https://{s}{s}#{s}", .{ host, path, latest }) }, self.ptrCwd().*);
+            _ = try self.run(&.{ "zig", "fetch", "--save=" ++ field.name, self.fmt("git+https://{s}{s}#{s}", .{ host.bytes, path, latest }) }, self.ptrCwd().*);
         }
     }
 
@@ -258,12 +263,16 @@ pub const VerboseBuilder = struct {
         return self.ptrBuilder().getInstallStep();
     }
 
-    pub inline fn ptrCwd(self: *@This()) *std.fs.Dir {
+    pub inline fn ptrCwd(self: *@This()) *std.Io.Dir {
         return &self.ptrRoot().handle;
     }
 
-    inline fn ptrDir(self: *@This()) *std.fs.Dir {
+    inline fn ptrDir(self: *@This()) *std.Io.Dir {
         return &self.__dir;
+    }
+
+    inline fn getIo(self: *@This()) std.Io {
+        return self.__io;
     }
 
     inline fn getPrefix(self: @This()) []const u8 {
@@ -274,19 +283,19 @@ pub const VerboseBuilder = struct {
         return &self.__prefix;
     }
 
-    inline fn getWalker(self: @This()) ?std.fs.Dir.Walker {
+    inline fn getWalker(self: @This()) ?std.Io.Dir.Walker {
         return self.__walker;
     }
 
-    inline fn ptrWalker(self: *@This()) *std.fs.Dir.Walker {
+    inline fn ptrWalker(self: *@This()) *std.Io.Dir.Walker {
         return &self.__walker.?;
     }
 
-    inline fn getIterator(self: @This()) ?std.fs.Dir.Iterator {
+    inline fn getIterator(self: @This()) ?std.Io.Dir.Iterator {
         return self.__iterator;
     }
 
-    inline fn ptrIterator(self: *@This()) *std.fs.Dir.Iterator {
+    inline fn ptrIterator(self: *@This()) *std.Io.Dir.Iterator {
         return &self.__iterator.?;
     }
 
@@ -302,8 +311,8 @@ pub const VerboseBuilder = struct {
         return self.ptrBuilder().graph;
     }
 
-    inline fn ptrEnvMap(self: *@This()) *std.process.EnvMap {
-        return &self.ptrGraph().env_map;
+    inline fn ptrEnvMap(self: *@This()) *std.process.Environ.Map {
+        return &self.ptrGraph().environ_map;
     }
 
     pub inline fn putEnvVar(self: *@This(), key: []const u8, value: []const u8) !void {
@@ -442,24 +451,24 @@ pub const VerboseBuilder = struct {
 
     pub fn linkLibrary(self: *@This(), compile1: *std.Build.Step.Compile, compile2: *std.Build.Step.Compile) void {
         options.debug("Linking \"{s}\" {s} to \"{s}\" {s}", .{ compile2.name, self.kind(compile2), compile1.name, self.kind(compile1) });
-        compile1.linkLibrary(compile2);
+        compile1.root_module.linkLibrary(compile2);
     }
 
     pub fn linkSystemLibrary(self: *@This(), compile: *std.Build.Step.Compile, name: []const u8) void {
         options.debug("Linking \"{s}\" system library to \"{s}\" {s}", .{ name, compile.name, self.kind(compile) });
-        compile.linkSystemLibrary(name);
+        compile.root_module.linkSystemLibrary(name, .{});
     }
 
     pub fn linkFramework(self: *@This(), compile: *std.Build.Step.Compile, name: []const u8) void {
         options.debug("Linking \"{s}\" framework to \"{s}\" {s}", .{ name, compile.name, self.kind(compile) });
-        compile.linkFramework(name);
+        compile.root_module.linkFramework(name, .{});
     }
 
     pub fn addCSource(self: *@This(), compile: *std.Build.Step.Compile, paths: []const []const u8, flags: []const []const u8) void {
         const path = self.resolve(paths);
         const joined_flags = self.join("\", \"", flags);
         options.debug("Adding C Source {s} to \"{s}\" {s} with these flags: \"{s}\"", .{ path, compile.name, self.kind(compile), joined_flags });
-        compile.addCSourceFile(.{ .file = self.ptrBuilder().path(path), .flags = flags });
+        compile.root_module.addCSourceFile(.{ .file = self.ptrBuilder().path(path), .flags = flags });
     }
 
     pub fn addCMacro(_: *@This(), compile: *std.Build.Step.Compile, key: []const u8, value: []const u8) void {
@@ -475,7 +484,7 @@ pub const VerboseBuilder = struct {
     pub fn addInclude(self: *@This(), compile: *std.Build.Step.Compile, paths: []const []const u8) void {
         const path = self.resolve(paths);
         options.debug("Including {s} into \"{s}\" {s}", .{ path, compile.name, self.kind(compile) });
-        compile.addIncludePath(self.ptrBuilder().path(path));
+        compile.root_module.addIncludePath(self.ptrBuilder().path(path));
     }
 
     pub fn addIncludePath(self: *@This(), compile: *std.Build.Step.Compile, path: std.Build.LazyPath) void {
@@ -485,7 +494,7 @@ pub const VerboseBuilder = struct {
             .dependency => |*lazy| options.debug("Including {s} into \"{s}\" {s}", .{ lazy.sub_path, compile.name, self.kind(compile) }),
             .cwd_relative => |lazy| options.debug("Including {s} into \"{s}\" {s}", .{ lazy, compile.name, self.kind(compile) }),
         }
-        compile.addIncludePath(path);
+        compile.root_module.addIncludePath(path);
     }
 
     pub fn addConfigHeaderIntoCompile(self: *@This(), compile: *std.Build.Step.Compile, config_header: *std.Build.Step.ConfigHeader) void {
@@ -525,35 +534,43 @@ pub const VerboseBuilder = struct {
         compile.installHeader(self.ptrBuilder().path(source_path), dest_path);
     }
 
-    pub fn run(self: *@This(), argv: []const []const u8, cwd: std.fs.Dir) ![]const u8 {
+    pub fn run(self: *@This(), argv: []const []const u8, cwd: std.Io.Dir) ![]const u8 {
         std.debug.assert(argv.len != 0);
         options.debug("Running \"{s}\"", .{self.join(" ", argv)});
 
         if (!std.process.can_spawn) return error.ExecNotSupported;
 
-        const max_output_size = 400 * 1024;
-        var child = std.process.Child.init(argv, self.getAllocator());
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-        child.cwd_dir = cwd;
-        child.env_map = &self.ptrBuilder().graph.env_map;
+        const spawn_options: std.process.SpawnOptions = .{
+            .argv = argv,
+            .stdin = .ignore,
+            .stdout = .pipe,
+            .stderr = .pipe,
+            .cwd = .{ .dir = cwd },
+            .environ_map = &self.ptrBuilder().graph.environ_map,
+        };
 
         var stdout: std.ArrayList(u8) = .empty;
         defer stdout.deinit(self.getAllocator());
         var stderr: std.ArrayList(u8) = .empty;
         defer stderr.deinit(self.getAllocator());
+        var stdout_buf: [4096]u8 = undefined;
+        var stderr_buf: [4096]u8 = undefined;
 
-        try std.Build.Step.handleVerbose2(self.ptrBuilder(), null, child.env_map, argv);
-        try child.spawn();
+        try std.Build.Step.handleVerbose2(self.ptrBuilder(), .inherit, spawn_options.environ_map, argv);
+        var child = try std.process.spawn(self.getIo(), spawn_options);
         errdefer {
-            _ = child.kill() catch {};
+            child.kill(self.getIo());
         }
-        try child.collectOutput(self.getAllocator(), &stdout, &stderr, max_output_size);
 
-        const term = try child.wait();
+        var stdout_reader = child.stdout.?.reader(self.getIo(), &stdout_buf).interface;
+        var stderr_reader = child.stderr.?.reader(self.getIo(), &stderr_buf).interface;
+
+        try stdout_reader.appendRemaining(self.getAllocator(), &stdout, .unlimited);
+        try stderr_reader.appendRemaining(self.getAllocator(), &stderr, .unlimited);
+
+        const term = try child.wait(self.getIo());
         switch (term) {
-            .Exited => |code| {
+            .exited => |code| {
                 if (code != 0) {
                     options.err("System command failed. Exit code: \"{d}\"", .{@as(u8, @truncate(code))});
                     var it = std.mem.tokenizeScalar(u8, stderr.items, '\n');
@@ -565,7 +582,13 @@ pub const VerboseBuilder = struct {
                 while (it.next()) |line| options.info("   {s}", .{line});
                 return trimmed;
             },
-            .Signal, .Stopped, .Unknown => |code| {
+            .signal => |code| {
+                options.err("System command failed. Exit code: \"{any}\"", .{code});
+                var it = std.mem.tokenizeScalar(u8, stderr.items, '\n');
+                while(it.next()) |line| options.err("  {s}", .{line});
+                return error.ProcessTerminated;
+            },
+            .stopped, .unknown => |code| {
                 options.err("System command failed. Exit code: \"{d}\"", .{@as(u8, @truncate(code))});
                 var it = std.mem.tokenizeScalar(u8, stderr.items, '\n');
                 while (it.next()) |line| options.err("  {s}", .{line});
@@ -597,7 +620,7 @@ pub const VerboseBuilder = struct {
 
     pub fn captureStdOut(_: @This(), r: *std.Build.Step.Run) std.Build.LazyPath {
         options.debug("Capturing stdout from \"{s}\" run step", .{r.step.name});
-        return r.captureStdOut();
+        return r.captureStdOut(.{});
     }
 
     pub fn addArgs(self: @This(), r: *std.Build.Step.Run, args: []const []const u8) void {
@@ -621,17 +644,17 @@ pub const VerboseBuilder = struct {
         step1.dependOn(step2);
     }
 
-    // std.fs wrappers --------------------------------------------------------
+    // std.fs & std.Io wrappers --------------------------------------------------------
 
-    pub fn openDir(self: *@This(), paths: []const []const u8) !std.fs.Dir {
+    pub fn openDir(self: *@This(), paths: []const []const u8) !std.Io.Dir {
         const path = self.resolve(paths);
         options.debug("Opening {s}{s}{s}", .{ self.getBuilder().dep_prefix, self.getPrefix(), path });
-        return self.ptrCwd().openDir(path, .{ .iterate = true });
+        return self.ptrCwd().openDir(self.getIo(), path, .{ .iterate = true });
     }
 
     pub fn access(self: *@This(), paths: []const []const u8) bool {
         const path = self.resolve(paths);
-        const res = !std.meta.isError(self.ptrCwd().access(path, .{}));
+        const res = !std.meta.isError(self.ptrCwd().access(self.getIo(), path, .{}));
         if (res) options.debug("Accessing {s}", .{path}) else options.debug("Can not access {s}", .{path});
         return res;
     }
@@ -639,15 +662,14 @@ pub const VerboseBuilder = struct {
     pub fn remove(self: *@This(), paths: []const []const u8) !void {
         const path = self.resolve(paths);
         options.debug("Removing {s}{s}{s}", .{ self.getBuilder().dep_prefix, self.getPrefix(), path });
-        self.ptrCwd().deleteTree(path) catch |err|
+        self.ptrCwd().deleteTree(self.getIo(), path) catch |err|
             if (err != error.FileNotFound) return err;
     }
 
     pub fn make(self: *@This(), paths: []const []const u8) !void {
         const path = self.resolve(paths);
         options.debug("Making {s}{s}{s}", .{ self.getBuilder().dep_prefix, self.getPrefix(), path });
-        self.ptrCwd().makeDir(path) catch |err|
-            if (err != error.PathAlreadyExists) return err;
+        try self.ptrCwd().createDirPath(self.getIo(), path);
     }
 
     pub fn copy(dest: *@This(), dest_paths: []const []const u8, source: *@This(), source_paths: []const []const u8) !void {
@@ -659,10 +681,10 @@ pub const VerboseBuilder = struct {
             dest_path,
         });
         if (dest.access(dest_paths)) return error.OverwritingCopy;
-        try source.ptrCwd().copyFile(source_path, dest.ptrCwd().*, dest_path, .{});
+        try source.ptrCwd().copyFile(source_path, dest.ptrCwd().*, dest_path, dest.getIo(), .{});
     }
 
-    pub fn iterate(self: *@This(), paths: []const []const u8) !?std.fs.Dir.Entry {
+    pub fn iterate(self: *@This(), paths: []const []const u8) !?std.Io.Dir.Entry {
         if (self.getIterator() == null) {
             self.ptrDir().* = try self.openDir(paths);
             const path = self.resolve(paths);
@@ -672,10 +694,10 @@ pub const VerboseBuilder = struct {
 
         // skip hidden files
         const entry = blk: {
-            var next = try self.ptrIterator().next();
+            var next = try self.ptrIterator().next(self.getIo());
             if (next == null) break :blk null;
             while (std.mem.startsWith(u8, next.?.name, ".")) {
-                next = try self.ptrIterator().next();
+                next = try self.ptrIterator().next(self.getIo());
                 if (next == null) break :blk null;
             }
             break :blk next;
@@ -684,7 +706,7 @@ pub const VerboseBuilder = struct {
         if (entry) |e| {
             options.debug("Iterating into {s}{s}{s} {s}", .{ self.getBuilder().dep_prefix, self.getPrefix(), e.name, @tagName(e.kind) });
         } else {
-            self.ptrDir().close();
+            self.ptrDir().close(self.getIo());
             self.ptrDir().* = self.ptrCwd().*;
             self.ptrPrefix().* = "/";
             self.__iterator = null;
@@ -693,7 +715,7 @@ pub const VerboseBuilder = struct {
         return entry;
     }
 
-    pub fn walk(self: *@This(), paths: []const []const u8) !?std.fs.Dir.Walker.Entry {
+    pub fn walk(self: *@This(), paths: []const []const u8) !?std.Io.Dir.Walker.Entry {
         if (self.getWalker() == null) {
             options.debug("Allocating ressources for walker", .{});
             self.ptrDir().* = try self.openDir(paths);
@@ -704,12 +726,12 @@ pub const VerboseBuilder = struct {
 
         // skip hidden files
         const entry = blk: {
-            var next = try self.ptrWalker().next();
+            var next = try self.ptrWalker().next(self.getIo());
             if (next == null) break :blk null;
             var it = std.mem.tokenizeScalar(u8, next.?.path, std.fs.path.sep);
             while (it.next()) |token| {
                 if (std.mem.startsWith(u8, token, ".")) {
-                    next = try self.ptrWalker().next();
+                    next = try self.ptrWalker().next(self.getIo());
                     if (next == null) break :blk null;
                     it = std.mem.tokenizeScalar(u8, next.?.path, std.fs.path.sep);
                 }
@@ -721,7 +743,7 @@ pub const VerboseBuilder = struct {
             options.debug("Walking into {s}{s}{s} {s}", .{ self.getBuilder().dep_prefix, self.getPrefix(), e.path, @tagName(e.kind) });
         } else {
             options.debug("Freeing ressources for walker", .{});
-            self.ptrDir().close();
+            self.ptrDir().close(self.getIo());
             self.ptrDir().* = self.ptrCwd().*;
             self.ptrPrefix().* = "/";
             self.ptrWalker().deinit();
@@ -734,13 +756,13 @@ pub const VerboseBuilder = struct {
     pub fn readFile(self: *@This(), paths: []const []const u8) ![]const u8 {
         const path = self.resolve(paths);
         options.debug("Reading {s}", .{path});
-        return self.ptrCwd().readFileAlloc(self.getAllocator(), path, std.math.maxInt(usize));
+        return self.ptrCwd().readFileAlloc(self.getIo(), self.getAllocator(), path, std.math.maxInt(usize));
     }
 
     pub fn writeFile(self: *@This(), paths: []const []const u8, content: []const u8) !void {
         const path = self.resolve(paths);
         options.debug("Writing into {s}", .{path});
-        try self.ptrCwd().writeFile(.{ .sub_path = path, .data = content });
+        try self.ptrCwd().writeFile(self.getIo(), .{ .sub_path = path, .data = content });
     }
 };
 
